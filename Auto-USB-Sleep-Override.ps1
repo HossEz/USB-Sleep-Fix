@@ -210,7 +210,7 @@ if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 function Show-Title {
     Clear-Host
     Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host "   USB SLEEP FIX TOOL (Fixed Command Execution)" -ForegroundColor Cyan
+    Write-Host "                USB SLEEP FIX TOOL                " -ForegroundColor Cyan
     Write-Host "      Fix USB devices preventing system sleep" -ForegroundColor Cyan
     Write-Host "==================================================" -ForegroundColor Cyan
     Write-Host ""
@@ -225,7 +225,7 @@ function Show-Menu {
     Write-Host ""
     Write-Host "--- DIAGNOSTICS & REMOVAL ---" -ForegroundColor DarkCyan
     Write-Host "3. See what's currently preventing sleep" -ForegroundColor Cyan
-    Write-Host "4. Show all existing request overrides" -ForegroundColor Magenta
+    Write-Host "4. Show all existing fixes (request overrides)" -ForegroundColor Magenta
     Write-Host "5. Remove fixes applied by this script" -ForegroundColor Red
     Write-Host ""
     Write-Host "--- PERSISTENCE (RUNS FIX ON STARTUP) ---" -ForegroundColor DarkCyan

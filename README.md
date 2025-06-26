@@ -2,7 +2,7 @@
 
 A PowerShell utility that fixes USB devices preventing your Windows PC from entering sleep mode.
 
-![Main Menu](https://i.imgur.com/aBCQds2.png)
+![Main Menu](https://i.imgur.com/XCMCLrL.png)
 
 ---
 
