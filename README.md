@@ -12,7 +12,6 @@ A PowerShell utility that fixes USB devices preventing your Windows PC from ente
 - 🔌 **Fix all USB devices** (mice, keyboards, etc.)
 - 🔍 **Check current sleep blockers**
 - ⚠️ **Safe removal options** (undo changes)
-- ✅ **Tracks applied fixes for easy uninstallation**
 - 🚀 **Persistence mode** (auto-run on startup)
 
 ---
