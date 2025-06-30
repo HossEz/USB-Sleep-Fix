@@ -14,12 +14,75 @@ if (-not (Test-Path $scriptDir)) {
     New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
 }
 
+# Configuration file path
+$configFile = "$scriptDir\USB-Sleep-Fix-Config.json"
+
+# Default configuration
+$defaultConfig = @{
+    ResetPowerOptions = $true
+    BlacklistedDevices = @()
+    PersistenceMode = "All"  # New setting: "Audio" or "All"
+    Version = "1.0"
+}
+
+# Load configuration
+function Get-Configuration {
+    if (Test-Path $configFile) {
+        try {
+            $config = Get-Content $configFile -Raw | ConvertFrom-Json
+            # Ensure all required properties exist
+            if (-not $config.PSObject.Properties['ResetPowerOptions']) { $config | Add-Member -NotePropertyName 'ResetPowerOptions' -NotePropertyValue $true }
+            if (-not $config.PSObject.Properties['BlacklistedDevices']) { $config | Add-Member -NotePropertyName 'BlacklistedDevices' -NotePropertyValue @() }
+            if (-not $config.PSObject.Properties['PersistenceMode']) { $config | Add-Member -NotePropertyName 'PersistenceMode' -NotePropertyValue "All" }  # New
+            if (-not $config.PSObject.Properties['Version']) { $config | Add-Member -NotePropertyName 'Version' -NotePropertyValue "1.0" }
+            return $config
+        }
+        catch {
+            Write-Host "[CONFIG] Error loading config, using defaults: $($_.Exception.Message)" -ForegroundColor Yellow
+            return $defaultConfig
+        }
+    }
+    return $defaultConfig
+}
+
+# Save configuration
+function Save-Configuration {
+    param($config)
+    try {
+        $config | ConvertTo-Json -Depth 10 | Set-Content $configFile -Encoding UTF8
+        return $true
+    }
+    catch {
+        Write-Host "[CONFIG] Error saving config: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+# Check if device is blacklisted
+function Test-DeviceBlacklisted {
+    param($device, $config)
+    foreach ($blacklisted in $config.BlacklistedDevices) {
+        if ($device.InstanceId -eq $blacklisted.InstanceId -or 
+            $device.FriendlyName -eq $blacklisted.FriendlyName) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# --- SILENT MODE (for Scheduled Task) ---
 # --- SILENT MODE (for Scheduled Task) ---
 if ($silentFixAll) {
+    # Load configuration
+    $config = Get-Configuration
+    
     # Create detailed log file in script directory
     $logPath = "$scriptDir\USB-SleepFix-Persistence.log"
     "===== Silent Mode Started at $(Get-Date) =====" | Out-File $logPath
     "System Uptime: $((Get-CimInstance Win32_OperatingSystem).LastBootUpTime)" | Out-File $logPath -Append
+    "Configuration - Reset Power Options: $($config.ResetPowerOptions)" | Out-File $logPath -Append
+    "Configuration - Blacklisted Devices: $($config.BlacklistedDevices.Count)" | Out-File $logPath -Append
+    "Configuration - Persistence Mode: $($config.PersistenceMode)" | Out-File $logPath -Append
     
     try {
         # Wait for device initialization
@@ -81,26 +144,50 @@ if ($silentFixAll) {
             "No existing fixes found" | Out-File $logPath -Append
         }
         
-        # Reset power configuration
-        "Resetting power configuration..." | Out-File $logPath -Append
-        try {
-            $resetResult = Invoke-Expression "powercfg /restoredefaultschemes" 2>&1
-            "Reset result: $resetResult" | Out-File $logPath -Append
-        }
-        catch {
-            "Reset error: $($_.Exception.Message)" | Out-File $logPath -Append
-        }
-        Start-Sleep -Seconds 5
-        
-        # Step 2: Fix ALL USB devices
-        "Step 2: Fixing all USB devices" | Out-File $logPath -Append
-        $devicesToFix = Get-PnpDevice -PresentOnly | Where-Object { 
-            $_.InstanceId -like "USB*" -and $_.Status -eq "OK" -and 
-            ($_.FriendlyName -match "(Audio|Sound|Headset|Speaker|Microphone|Mouse|Keyboard)" -or 
-            $_.Class -in @("AudioEndpoint", "MEDIA", "HIDClass"))
+        # Reset power configuration (only if enabled in config)
+        if ($config.ResetPowerOptions) {
+            "Resetting power configuration..." | Out-File $logPath -Append
+            try {
+                $resetResult = Invoke-Expression "powercfg /restoredefaultschemes" 2>&1
+                "Reset result: $resetResult" | Out-File $logPath -Append
+            }
+            catch {
+                "Reset error: $($_.Exception.Message)" | Out-File $logPath -Append
+            }
+            Start-Sleep -Seconds 5
+        } else {
+            "Skipping power configuration reset (disabled in config)" | Out-File $logPath -Append
         }
         
-        "Found $($devicesToFix.Count) USB devices to fix" | Out-File $logPath -Append
+        # Step 2: Fix devices based on persistence mode
+        "Step 2: Fixing devices based on persistence mode: $($config.PersistenceMode)" | Out-File $logPath -Append
+        
+        if ($config.PersistenceMode -eq "Audio") {
+            $allDevicesToFix = Get-PnpDevice -PresentOnly | Where-Object { 
+                $_.InstanceId -like "USB*" -and $_.Status -eq "OK" -and 
+                ($_.FriendlyName -match "(Audio|Sound|Headset|Speaker|Microphone)" -or $_.Class -in @("AudioEndpoint", "MEDIA"))
+            }
+        } else {
+            $allDevicesToFix = Get-PnpDevice -PresentOnly | Where-Object { 
+                $_.InstanceId -like "USB*" -and $_.Status -eq "OK" -and 
+                ($_.FriendlyName -match "(Audio|Sound|Headset|Speaker|Microphone|Mouse|Keyboard)" -or 
+                $_.Class -in @("AudioEndpoint", "MEDIA", "HIDClass"))
+            }
+        }
+        
+        # Filter out blacklisted devices
+        $devicesToFix = @()
+        $blacklistedCount = 0
+        foreach ($device in $allDevicesToFix) {
+            if (Test-DeviceBlacklisted -device $device -config $config) {
+                "  Skipping blacklisted device: $($device.FriendlyName)" | Out-File $logPath -Append
+                $blacklistedCount++
+            } else {
+                $devicesToFix += $device
+            }
+        }
+        
+        "Found $($allDevicesToFix.Count) total USB devices ($($config.PersistenceMode) mode), $blacklistedCount blacklisted, $($devicesToFix.Count) to fix" | Out-File $logPath -Append
         
         # Track processed devices and results
         $processedDevices = @()
@@ -191,7 +278,6 @@ if ($silentFixAll) {
     
     exit
 }
-
 # --- INTERACTIVE MODE ---
 
 # Check if running as administrator
@@ -236,9 +322,357 @@ function Show-Menu {
         Write-Host "6. Make Fixes Persistent (Run on startup)" -ForegroundColor DarkGreen
     }
     Write-Host ""
-    Write-Host "7. Exit" -ForegroundColor Gray
+    Write-Host "--- CONFIGURATION ---" -ForegroundColor DarkCyan
+    Write-Host "7. Settings/Configuration" -ForegroundColor Cyan  # Changed from DarkMagenta to Cyan
     Write-Host ""
-    Write-Host "Enter your choice (1-7): " -ForegroundColor White -NoNewline
+    Write-Host "8. Exit" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Enter your choice (1-8): " -ForegroundColor White -NoNewline
+}
+
+function Show-SettingsMenu {
+    $config = Get-Configuration
+    
+    Show-Title
+    Write-Host "SETTINGS & CONFIGURATION" -ForegroundColor DarkMagenta
+    Write-Host "--------------------------------------------------" -ForegroundColor DarkCyan
+    Write-Host ""
+    Write-Host "Current Settings:" -ForegroundColor White
+    Write-Host "  Power Options Reset: " -NoNewline -ForegroundColor Gray
+    if ($config.ResetPowerOptions) {
+        Write-Host "ENABLED" -ForegroundColor Green
+        Write-Host "    (Script will reset power schemes before applying fixes)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "DISABLED" -ForegroundColor Red
+        Write-Host "    (Script will NOT reset power schemes)" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "  Blacklisted Devices: " -NoNewline -ForegroundColor Gray
+    Write-Host "$($config.BlacklistedDevices.Count)" -ForegroundColor Yellow
+    if ($config.BlacklistedDevices.Count -gt 0) {
+        Write-Host "    (These devices will be ignored by the script)" -ForegroundColor DarkGray
+        foreach ($device in $config.BlacklistedDevices) {
+            Write-Host "    - $($device.FriendlyName)" -ForegroundColor DarkYellow
+        }
+    } else {
+        Write-Host "    (No devices are blacklisted)" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "  Persistence Mode: " -NoNewline -ForegroundColor Gray
+    if ($config.PersistenceMode -eq "Audio") {
+        Write-Host "AUDIO DEVICES ONLY" -ForegroundColor Cyan
+        Write-Host "    (Persistence task will fix only audio devices)" -ForegroundColor DarkGray
+    } else {
+        Write-Host "ALL USB DEVICES" -ForegroundColor Cyan
+        Write-Host "    (Persistence task will fix all USB devices)" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    Write-Host "--------------------------------------------------" -ForegroundColor DarkCyan
+    Write-Host "1. Toggle Power Options Reset" -ForegroundColor Cyan
+    Write-Host "2. Manage Device Blacklist" -ForegroundColor Cyan
+    Write-Host "3. Set Persistence Mode" -ForegroundColor Cyan  # New option
+    Write-Host "4. Reset Configuration to Defaults" -ForegroundColor Red
+    Write-Host "5. Back to Main Menu" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Enter your choice (1-5): " -ForegroundColor White -NoNewline
+}
+
+function Set-PersistenceMode {
+    $config = Get-Configuration
+    $currentMode = $config.PersistenceMode
+
+    Write-Host ""
+    Write-Host "[SETTING] Set Persistence Mode" -ForegroundColor Cyan
+    Write-Host "Current mode: $currentMode" -ForegroundColor White
+    Write-Host ""
+    Write-Host "Choose the mode for the persistence task (runs on startup):"
+    Write-Host "  1. Audio devices only (fix only audio devices)"
+    Write-Host "  2. All USB devices (fix audio, mouse, keyboard, etc.)"
+    Write-Host ""
+    Write-Host "Enter your choice (1 or 2): " -NoNewline
+    $choice = Read-Host
+
+    if ($choice -eq "1") {
+        $config.PersistenceMode = "Audio"
+        if (Save-Configuration -config $config) {
+            Write-Host "[SUCCESS] Persistence mode set to: Audio devices only" -ForegroundColor Green
+        } else {
+            Write-Host "[ERROR] Failed to save configuration!" -ForegroundColor Red
+        }
+    } elseif ($choice -eq "2") {
+        $config.PersistenceMode = "All"
+        if (Save-Configuration -config $config) {
+            Write-Host "[SUCCESS] Persistence mode set to: All USB devices" -ForegroundColor Green
+        } else {
+            Write-Host "[ERROR] Failed to save configuration!" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "[ERROR] Invalid choice. No changes made." -ForegroundColor Red
+    }
+}
+
+function Manage-Settings {
+    do {
+        Show-SettingsMenu
+        $choice = Read-Host
+        
+        switch ($choice) {
+            "1" {
+                Toggle-PowerOptionsReset
+                Wait-ForUser
+            }
+            "2" {
+                Manage-DeviceBlacklist
+                Wait-ForUser
+            }
+            "3" {  # New option handler
+                Set-PersistenceMode
+                Wait-ForUser
+            }
+            "4" {
+                Reset-Configuration
+                Wait-ForUser
+            }
+            "5" {
+                return
+            }
+            default {
+                Write-Host " [ERROR] Invalid choice. Please enter 1-5." -ForegroundColor Red
+                Start-Sleep -Seconds 2
+            }
+        }
+    } while ($true)
+}
+
+function Toggle-PowerOptionsReset {
+    $config = Get-Configuration
+    $currentState = $config.ResetPowerOptions
+    
+    Write-Host ""
+    Write-Host "[SETTING] Power Options Reset Toggle" -ForegroundColor Cyan
+    Write-Host "Current state: " -NoNewline
+    if ($currentState) {
+        Write-Host "ENABLED" -ForegroundColor Green
+        Write-Host "This means the script will reset power schemes before applying fixes."
+        Write-Host "This ensures a clean state but may override custom power settings."
+    } else {
+        Write-Host "DISABLED" -ForegroundColor Red
+        Write-Host "This means the script will NOT reset power schemes."
+        Write-Host "Existing power configurations will be preserved."
+    }
+    Write-Host ""
+    
+    if (Confirm-Action "Do you want to toggle this setting?") {
+        $config.ResetPowerOptions = -not $currentState
+        if (Save-Configuration -config $config) {
+            $newState = if ($config.ResetPowerOptions) { "ENABLED" } else { "DISABLED" }
+            Write-Host "[SUCCESS] Power Options Reset is now: $newState" -ForegroundColor Green
+        } else {
+            Write-Host "[ERROR] Failed to save configuration!" -ForegroundColor Red
+        }
+    }
+}
+
+function Manage-DeviceBlacklist {
+    do {
+        $config = Get-Configuration
+        Show-Title
+        Write-Host "DEVICE BLACKLIST MANAGEMENT" -ForegroundColor DarkMagenta
+        Write-Host "--------------------------------------------------" -ForegroundColor DarkCyan
+        Write-Host ""
+        Write-Host "Blacklisted Devices ($($config.BlacklistedDevices.Count)):" -ForegroundColor White
+        if ($config.BlacklistedDevices.Count -eq 0) {
+            Write-Host "  (No devices are currently blacklisted)" -ForegroundColor DarkGray
+        } else {
+            for ($i = 0; $i -lt $config.BlacklistedDevices.Count; $i++) {
+                $device = $config.BlacklistedDevices[$i]
+                Write-Host "  $($i + 1). $($device.FriendlyName)" -ForegroundColor Yellow
+                Write-Host "      Instance ID: $($device.InstanceId)" -ForegroundColor DarkGray
+            }
+        }
+        Write-Host ""
+        Write-Host "--------------------------------------------------" -ForegroundColor DarkCyan
+        Write-Host "1. Add device to blacklist" -ForegroundColor Green
+        if ($config.BlacklistedDevices.Count -gt 0) {
+            Write-Host "2. Remove device from blacklist" -ForegroundColor Red
+        }
+        Write-Host "3. Back to Settings Menu" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host "Enter your choice: " -ForegroundColor White -NoNewline
+        
+        $choice = Read-Host
+        
+        switch ($choice) {
+            "1" {
+                Add-DeviceToBlacklist
+                Wait-ForUser
+            }
+            "2" {
+                if ($config.BlacklistedDevices.Count -gt 0) {
+                    Remove-DeviceFromBlacklist
+                    Wait-ForUser
+                } else {
+                    Write-Host " [ERROR] Invalid choice." -ForegroundColor Red
+                    Start-Sleep -Seconds 2
+                }
+            }
+            "3" {
+                return
+            }
+            default {
+                Write-Host " [ERROR] Invalid choice." -ForegroundColor Red
+                Start-Sleep -Seconds 2
+            }
+        }
+    } while ($true)
+}
+
+function Add-DeviceToBlacklist {
+    Write-Host ""
+    Write-Host "[BLACKLIST] Adding device to blacklist" -ForegroundColor Yellow
+    Write-Host "Scanning for USB devices that would normally be processed..." -ForegroundColor Gray
+    
+    $devices = Get-ProblematicDevices -FilterType "all"
+    $config = Get-Configuration
+    
+    # Filter out already blacklisted devices
+    $availableDevices = @()
+    foreach ($device in $devices) {
+        if (-not (Test-DeviceBlacklisted -device $device -config $config)) {
+            $availableDevices += $device
+        }
+    }
+    
+    if ($availableDevices.Count -eq 0) {
+        Write-Host "[INFO] No devices available to blacklist (all are already blacklisted or no devices found)" -ForegroundColor Cyan
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "Available devices to blacklist:" -ForegroundColor White
+    Write-Host "--------------------------------------------------"
+    for ($i = 0; $i -lt $availableDevices.Count; $i++) {
+        $device = $availableDevices[$i]
+        Write-Host "  $($i + 1). $($device.FriendlyName)" -ForegroundColor White
+        Write-Host "      Class: $($device.Class) | Status: $($device.Status)" -ForegroundColor DarkGray
+    }
+    Write-Host "  0. Cancel" -ForegroundColor Gray
+    Write-Host "--------------------------------------------------"
+    Write-Host ""
+    Write-Host "Enter device number to blacklist: " -ForegroundColor White -NoNewline
+    
+    $selection = Read-Host
+    
+    if ($selection -eq "0") {
+        Write-Host "[CANCELLED] No device added to blacklist" -ForegroundColor Yellow
+        return
+    }
+    
+    try {
+        $deviceIndex = [int]$selection - 1
+        if ($deviceIndex -ge 0 -and $deviceIndex -lt $availableDevices.Count) {
+            $selectedDevice = $availableDevices[$deviceIndex]
+            
+            # Add to blacklist
+            $blacklistEntry = @{
+                FriendlyName = $selectedDevice.FriendlyName
+                InstanceId = $selectedDevice.InstanceId
+                Class = $selectedDevice.Class
+                DateAdded = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            }
+            
+            $config.BlacklistedDevices += $blacklistEntry
+            
+            if (Save-Configuration -config $config) {
+                Write-Host "[SUCCESS] Device added to blacklist: $($selectedDevice.FriendlyName)" -ForegroundColor Green
+                Write-Host "This device will be ignored by the script from now on." -ForegroundColor Cyan
+            } else {
+                Write-Host "[ERROR] Failed to save configuration!" -ForegroundColor Red
+            }
+        } else {
+            Write-Host "[ERROR] Invalid selection!" -ForegroundColor Red
+        }
+    }
+    catch {
+        Write-Host "[ERROR] Invalid input. Please enter a number." -ForegroundColor Red
+    }
+}
+
+function Remove-DeviceFromBlacklist {
+    $config = Get-Configuration
+    
+    if ($config.BlacklistedDevices.Count -eq 0) {
+        Write-Host "[INFO] No devices in blacklist to remove" -ForegroundColor Cyan
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "[BLACKLIST] Removing device from blacklist" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Current blacklisted devices:" -ForegroundColor White
+    Write-Host "--------------------------------------------------"
+    for ($i = 0; $i -lt $config.BlacklistedDevices.Count; $i++) {
+        $device = $config.BlacklistedDevices[$i]
+        Write-Host "  $($i + 1). $($device.FriendlyName)" -ForegroundColor Yellow
+        Write-Host "      Added: $($device.DateAdded)" -ForegroundColor DarkGray
+    }
+    Write-Host "  0. Cancel" -ForegroundColor Gray
+    Write-Host "--------------------------------------------------"
+    Write-Host ""
+    Write-Host "Enter device number to remove: " -ForegroundColor White -NoNewline
+    
+    $selection = Read-Host
+    
+    if ($selection -eq "0") {
+        Write-Host "[CANCELLED] No device removed from blacklist" -ForegroundColor Yellow
+        return
+    }
+    
+    try {
+        $deviceIndex = [int]$selection - 1
+        if ($deviceIndex -ge 0 -and $deviceIndex -lt $config.BlacklistedDevices.Count) {
+            $removedDevice = $config.BlacklistedDevices[$deviceIndex]
+            
+            # Remove from blacklist
+            $newBlacklist = @()
+            for ($i = 0; $i -lt $config.BlacklistedDevices.Count; $i++) {
+                if ($i -ne $deviceIndex) {
+                    $newBlacklist += $config.BlacklistedDevices[$i]
+                }
+            }
+            $config.BlacklistedDevices = $newBlacklist
+            
+            if (Save-Configuration -config $config) {
+                Write-Host "[SUCCESS] Device removed from blacklist: $($removedDevice.FriendlyName)" -ForegroundColor Green
+                Write-Host "This device will now be processed by the script again." -ForegroundColor Cyan
+            } else {
+                Write-Host "[ERROR] Failed to save configuration!" -ForegroundColor Red
+            }
+        } else {
+            Write-Host "[ERROR] Invalid selection!" -ForegroundColor Red
+        }
+    }
+    catch {
+        Write-Host "[ERROR] Invalid input. Please enter a number." -ForegroundColor Red
+    }
+}
+
+function Reset-Configuration {
+    Write-Host ""
+    Write-Host "[CONFIG] Reset Configuration to Defaults" -ForegroundColor Red
+    Write-Host "This will:" -ForegroundColor Yellow
+    Write-Host "  - Enable power options reset" -ForegroundColor Gray
+    Write-Host "  - Clear all blacklisted devices" -ForegroundColor Gray
+    Write-Host "  - Reset all settings to factory defaults" -ForegroundColor Gray
+    Write-Host ""
+    
+    if (Confirm-Action "Are you sure you want to reset all settings?") {
+        if (Save-Configuration -config $defaultConfig) {
+            Write-Host "[SUCCESS] Configuration reset to defaults!" -ForegroundColor Green
+        } else {
+            Write-Host "[ERROR] Failed to reset configuration!" -ForegroundColor Red
+        }
+    }
 }
 
 function Get-ProblematicDevices {
@@ -282,16 +716,39 @@ function Get-ProblematicDevices {
 function Show-DeviceList {
     param($devices, $action = "fix")
     
+    # Load configuration to check for blacklisted devices
+    $config = Get-Configuration
+    
     if ($devices.Count -eq 0) {
         Write-Host "[ERROR] No devices found matching the criteria!" -ForegroundColor Red
-        return $false
+        return @()
+    }
+    
+    # Filter out blacklisted devices
+    $filteredDevices = @()
+    $blacklistedCount = 0
+    foreach ($device in $devices) {
+        if (Test-DeviceBlacklisted -device $device -config $config) {
+            $blacklistedCount++
+        } else {
+            $filteredDevices += $device
+        }
+    }
+    
+    if ($filteredDevices.Count -eq 0) {
+        Write-Host "[INFO] No devices to process after filtering blacklisted devices" -ForegroundColor Cyan
+        return @()
     }
     
     Write-Host ""
-    Write-Host "Found $($devices.Count) device(s) to ${action}:" -ForegroundColor Green
+    Write-Host "Found $($devices.Count) device(s), $blacklistedCount blacklisted, $($filteredDevices.Count) to ${action}:" -ForegroundColor Green
     Write-Host "--------------------------------------------------"
     
-    foreach ($device in $devices) {
+    if ($blacklistedCount -gt 0) {
+        Write-Host "  (Note: $blacklistedCount device(s) are blacklisted and will be skipped)" -ForegroundColor DarkYellow
+    }
+    
+    foreach ($device in $filteredDevices) {
         $driverDate = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName DEVPKEY_Device_DriverDate).Data
         $driverProvider = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName DEVPKEY_Device_DriverProvider).Data
         Write-Host "  + $($device.FriendlyName)" -ForegroundColor White
@@ -299,25 +756,30 @@ function Show-DeviceList {
     }
     Write-Host "--------------------------------------------------"
     
-    return $true
+    return $filteredDevices
 }
 
 function Apply-SleepFix {
     param($devices)
     
+    # Load configuration
+    $config = Get-Configuration
+    
     Write-Host ""
     Write-Host "[APPLYING] Applying sleep fixes..." -ForegroundColor Yellow
     
-    # Reset power configuration first
-    Write-Host "  [PREP] Resetting power configuration..." -ForegroundColor Cyan
-    try {
-        $resetResult = Invoke-Expression "powercfg /restoredefaultschemes" 2>&1
-        Write-Host "    Reset result: $resetResult" -ForegroundColor DarkGray
+    # Reset power configuration first (if enabled)
+    if ($config.ResetPowerOptions) {
+        Write-Host "  [PREP] Resetting power configuration..." -ForegroundColor Cyan
+        try {
+            $resetResult = Invoke-Expression "powercfg /restoredefaultschemes" 2>&1
+            Write-Host "    Reset result: $resetResult" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "    Reset error: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Start-Sleep -Seconds 2
     }
-    catch {
-        Write-Host "    Reset error: $($_.Exception.Message)" -ForegroundColor Red
-    }
-    Start-Sleep -Seconds 2
     
     $successCount = 0
     $historyFile = "$scriptDir\USB-Sleep-Fix-History.txt"
@@ -447,16 +909,21 @@ function Remove-ScriptFixes {
     Write-Host ""
     Write-Host "[REMOVE] Removing script overrides..." -ForegroundColor Yellow
     
-    # Reset power configuration first
-    Write-Host "  [PREP] Resetting power configuration..." -ForegroundColor Cyan
-    try {
-        $resetResult = Invoke-Expression "powercfg /restoredefaultschemes" 2>&1
-        Write-Host "    Reset result: $resetResult" -ForegroundColor DarkGray
+    # Load configuration
+    $config = Get-Configuration
+    
+    # Reset power configuration first (if enabled)
+    if ($config.ResetPowerOptions) {
+        Write-Host "  [PREP] Resetting power configuration..." -ForegroundColor Cyan
+        try {
+            $resetResult = Invoke-Expression "powercfg /restoredefaultschemes" 2>&1
+            Write-Host "    Reset result: $resetResult" -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host "    Reset error: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Start-Sleep -Seconds 2
     }
-    catch {
-        Write-Host "    Reset error: $($_.Exception.Message)" -ForegroundColor Red
-    }
-    Start-Sleep -Seconds 2
     
     foreach ($override in $scriptOverrides) {
         $deviceName = $override.DeviceName
@@ -696,8 +1163,11 @@ do {
             Show-Title
             Write-Host "[OPTION 1] Audio Device Sleep Fix" -ForegroundColor Green
             $devices = Get-ProblematicDevices -FilterType "audio"
-            if (Show-DeviceList -devices $devices) {
-                if (Confirm-Action "Apply sleep fix to these audio devices?") { Apply-SleepFix -devices $devices }
+            $filteredDevices = Show-DeviceList -devices $devices
+            if ($filteredDevices.Count -gt 0) {
+                if (Confirm-Action "Apply sleep fix to these audio devices?") { 
+                    Apply-SleepFix -devices $filteredDevices 
+                }
             }
             Wait-ForUser
         }
@@ -705,8 +1175,11 @@ do {
             Show-Title
             Write-Host "[OPTION 2] All USB Device Sleep Fix" -ForegroundColor Green
             $devices = Get-ProblematicDevices -FilterType "all"
-            if (Show-DeviceList -devices $devices) {
-                if (Confirm-Action "Apply sleep fix to ALL these devices?") { Apply-SleepFix -devices $devices }
+            $filteredDevices = Show-DeviceList -devices $devices
+            if ($filteredDevices.Count -gt 0) {
+                if (Confirm-Action "Apply sleep fix to ALL these devices?") { 
+                    Apply-SleepFix -devices $filteredDevices 
+                }
             }
             Wait-ForUser
         }
@@ -735,12 +1208,15 @@ do {
             Wait-ForUser
         }
         "7" {
+            Manage-Settings
+        }
+        "8" {
             Show-Title
             Write-Host "[EXIT] Goodbye!" -ForegroundColor Green
             exit
         }
         default {
-            Write-Host " [ERROR] Invalid choice. Please enter 1-7." -ForegroundColor Red
+            Write-Host " [ERROR] Invalid choice. Please enter 1-8." -ForegroundColor Red
             Start-Sleep -Seconds 2
         }
     }
